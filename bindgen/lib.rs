@@ -95,6 +95,7 @@ pub use crate::regex_set::RegexSet;
 
 use std::borrow::Cow;
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -258,13 +259,18 @@ pub fn builder() -> Builder {
     Default::default()
 }
 
-fn get_extra_clang_args() -> Vec<String> {
+fn get_extra_clang_args(
+    parse_callbacks: &[Rc<dyn callbacks::ParseCallbacks>],
+) -> Vec<String> {
     // Add any extra arguments from the environment to the clang command line.
-    let extra_clang_args =
-        match get_target_dependent_env_var("BINDGEN_EXTRA_CLANG_ARGS") {
-            None => return vec![],
-            Some(s) => s,
-        };
+    let extra_clang_args = match get_target_dependent_env_var(
+        parse_callbacks,
+        "BINDGEN_EXTRA_CLANG_ARGS",
+    ) {
+        None => return vec![],
+        Some(s) => s,
+    };
+
     // Try to parse it with shell quoting. If we fail, make it one single big argument.
     if let Some(strings) = shlex::split(&extra_clang_args) {
         return strings;
@@ -1556,7 +1562,9 @@ impl Builder {
     pub fn generate(self) -> Result<Bindings, BindgenError> {
         let mut options = self.options.clone();
         // Add any extra arguments from the environment to the clang command line.
-        options.clang_args.extend(get_extra_clang_args());
+        options
+            .clang_args
+            .extend(get_extra_clang_args(&options.parse_callbacks));
 
         // Transform input headers to arguments on the clang command line.
         options.clang_args.extend(
@@ -1646,7 +1654,7 @@ impl Builder {
             cmd.arg(a);
         }
 
-        for a in get_extra_clang_args() {
+        for a in get_extra_clang_args(&self.options.parse_callbacks) {
             cmd.arg(a);
         }
 
@@ -2928,22 +2936,38 @@ pub fn clang_version() -> ClangVersion {
     }
 }
 
+fn env_var<K: AsRef<str> + AsRef<OsStr>>(
+    parse_callbacks: &[Rc<dyn callbacks::ParseCallbacks>],
+    key: K,
+) -> Result<String, std::env::VarError> {
+    for callback in parse_callbacks {
+        callback.read_env_var(key.as_ref());
+    }
+    std::env::var(key)
+}
+
 /// Looks for the env var `var_${TARGET}`, and falls back to just `var` when it is not found.
-fn get_target_dependent_env_var(var: &str) -> Option<String> {
-    if let Ok(target) = env::var("TARGET") {
-        if let Ok(v) = env::var(format!("{}_{}", var, target)) {
+fn get_target_dependent_env_var(
+    parse_callbacks: &[Rc<dyn callbacks::ParseCallbacks>],
+    var: &str,
+) -> Option<String> {
+    if let Ok(target) = env_var(parse_callbacks, "TARGET") {
+        if let Ok(v) = env_var(parse_callbacks, format!("{}_{}", var, target)) {
             return Some(v);
         }
-        if let Ok(v) = env::var(format!("{}_{}", var, target.replace('-', "_")))
-        {
+        if let Ok(v) = env_var(
+            parse_callbacks,
+            format!("{}_{}", var, target.replace('-', "_")),
+        ) {
             return Some(v);
         }
     }
-    env::var(var).ok()
+
+    env_var(parse_callbacks, var).ok()
 }
 
 /// A ParseCallbacks implementation that will act on file includes by echoing a rerun-if-changed
-/// line
+/// line and on env variable usage by echoing a rerun-if-env-changed line
 ///
 /// When running inside a `build.rs` script, this can be used to make cargo invalidate the
 /// generated bindings whenever any of the files included from the header change:
@@ -2960,6 +2984,10 @@ pub struct CargoCallbacks;
 impl callbacks::ParseCallbacks for CargoCallbacks {
     fn include_file(&self, filename: &str) {
         println!("cargo:rerun-if-changed={}", filename);
+    }
+
+    fn read_env_var(&self, key: &str) {
+        println!("cargo:rerun-if-env-changed={}", key);
     }
 }
 
